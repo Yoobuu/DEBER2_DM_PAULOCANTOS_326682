@@ -1,0 +1,82 @@
+# Mantén el header del template
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+import os
+import pathlib
+from urllib.request import urlopen
+import uuid  # <-- NUEVO: para run_id
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Descarga 1 parquet (service/year/month) a /home/src/data/nyctlc/<service>/
+    lo sube al stage @STG_NYCTLC_PARQUET en la ruta:
+      service=<service>/year=<yyyy>/month=<mm>/
+    Luego hace COPY INTO a BRONZE.<SERVICE>_PARQUET_RAW (con metadatos)
+    y lista el stage para verificar.
+    """
+    # 1) Parámetros (puedes cambiar valores por defecto desde variables del pipeline)
+    if not kwargs.get('pipeline_runtime'):
+        kwargs['pipeline_runtime'] = {
+            'variables': {
+                'service': 'yellow',
+                'year': 2019,
+                'month': 3,
+            }
+        }
+
+    pr = kwargs.get('pipeline_runtime') or {}
+    service = (pr.get('variables', {}).get('service', 'yellow') or 'yellow').lower()
+    year = int(pr.get('variables', {}).get('year', 2019))
+    month = int(pr.get('variables', {}).get('month', 1))
+    mm = f'{month:02d}'
+    url = f'https://d37ci6vzurychx.cloudfront.net/trip-data/{service}_tripdata_{year}-{mm}.parquet'
+    stage_subdir = f"service={service}/year={year}/month={mm}/"
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+    # 2) Rutas locales
+    base_dir = pathlib.Path('/home/src/data/nyctlc') / service
+    base_dir.mkdir(parents=True, exist_ok=True)
+    local_path = base_dir / f'{service}_tripdata_{year}-{mm}.parquet'
+
+    print(f'🔽 Descargando: {url}')
+    with urlopen(url) as r, open(local_path, 'wb') as f:
+        chunk = r.read()
+        f.write(chunk)
+
+    size_mb = round(local_path.stat().st_size / (1024*1024), 2)
+    print(f'✅ Archivo descargado en {local_path} ({size_mb} MB)')
+
+    # 3) Conexión a Snowflake con Secrets (NO asumimos nombres: se leen de Secrets)
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')               # ej: DM_NYCTLC
+    schema = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')      # debe ser BRONZE
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        login_timeout=20,
+        network_timeout=20,
+        client_session_keep_alive=False,
+        authenticator='snowflake',
+        insecure_mode=True,   # ⚠️ OCSP off solo si necesitas evitar bloqueos locales
+    )
+
+    cur = conn.cursor()
+
+    try:
+        # Contexto explícito

@@ -1,0 +1,206 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea la tabla de hechos GOLD.FCT_TRIPS_YELLOW (granular, 1 fila = 1 viaje)
+    y carga el mes indicado por Variables (por defecto 2019-03).
+    Detecta nombres reales de columnas para pickup/dropoff datetime y PU/DO location.
+    Idempotente por mes (DELETE + INSERT).
+    Aplica CLUSTER BY para rendimiento.
+    """
+    # Variables (qué mes cargar)
+    pr = kwargs.get('pipeline_runtime') or {}
+    v = pr.get('variables', {})
+    year = int(v.get('year', 2019))
+    month = int(v.get('month', 3))   # ← por defecto 3 para que coincida con tu mes cargado
+    mm = f'{month:02d}'
+    print(f"➡️ Carga FCT_TRIPS_YELLOW → year={year} month={month} mm={mm}")
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+    schema_gold = get_secret_value('SNOWFLAKE_SCHEMA_GOLD')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_gold,
+        client_session_keep_alive=True,
+        login_timeout=30,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_gold}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1200")
+
+        # --- Detectar nombres reales en SILVER.TRIPS_YELLOW (pickup/dropoff datetime + PU/DO IDs)
+        cur.execute(f"""
+            SELECT COLUMN_NAME
+            FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = 'TRIPS_YELLOW'
+        """, (schema_silver,))
+        cols = [r[0] for r in cur.fetchall()]
+        U = {c.upper(): c for c in cols}
+
+        # Candidatos típicos en NYC TLC
+        pu_loc_candidates = ['PULOCATIONID', 'PU_LOCATION_ID']
+        do_loc_candidates = ['DOLOCATIONID', 'DO_LOCATION_ID']
+        pu_dt_candidates  = ['PICKUP_DATETIME', 'TPEP_PICKUP_DATETIME']
+        do_dt_candidates  = ['DROPOFF_DATETIME', 'TPEP_DROPOFF_DATETIME']
+
+        def pick(cands):
+            for c in cands:
+                if c in U: return U[c]
+            return None
+
+        pu_loc = pick(pu_loc_candidates)
+        do_loc = pick(do_loc_candidates)
+        pu_dt  = pick(pu_dt_candidates)
+        do_dt  = pick(do_dt_candidates)
+
+        if not pu_loc or not do_loc:
+            raise Exception("No se detectaron columnas PU/DO location id en SILVER.TRIPS_YELLOW.")
+        if not pu_dt or not do_dt:
+            # Si no hay datetime normalizados, intentamos columnas raw conocidas
+            raw_pu = pick(['TPEP_PICKUP_DATETIME', 'LPEP_PICKUP_DATETIME'])
+            raw_do = pick(['TPEP_DROPOFF_DATETIME', 'LPEP_DROPOFF_DATETIME'])
+            if raw_pu and raw_do:
+                pu_dt, do_dt = raw_pu, raw_do
+            else:
+                # como último recurso, crea columnas nulas
+                pu_dt, do_dt = None, None
+
+        print(f"🔎 Columnas detectadas: PU_LOC='{pu_loc}', DO_LOC='{do_loc}', PU_DT='{pu_dt}', DO_DT='{do_dt}'")
+
+        # --- Crear tabla FCT (clustered)
+        print("▶ Creando tabla GOLD.FCT_TRIPS_YELLOW (si no existe) ...")
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {database}.{schema_gold}.FCT_TRIPS_YELLOW (
+            trip_id                STRING,
+            service_type           STRING,
+            trip_year              INT,
+            trip_month             INT,
+            pickup_datetime        TIMESTAMP_NTZ,
+            dropoff_datetime       TIMESTAMP_NTZ,
+            pu_location_id         INT,
+            do_location_id         INT,
+            passenger_count        FLOAT,
+            trip_distance          FLOAT,
+            ratecode_id            FLOAT,
+            payment_type           FLOAT,
+            fare_amount            NUMERIC(18,2),
+            extra                  NUMERIC(18,2),
+            mta_tax                NUMERIC(18,2),
+            tip_amount             NUMERIC(18,2),
+            tolls_amount           NUMERIC(18,2),
+            improvement_surcharge  NUMERIC(18,2),
+            total_amount           NUMERIC(18,2),
+            pickup_zone            STRING,
+            pickup_borough         STRING,
+            dropoff_zone           STRING,
+            dropoff_borough        STRING,
+            created_at             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        CLUSTER BY (trip_year, trip_month, pu_location_id);
+        """)
+
+        # --- Idempotencia por mes
+        print("🧹 Borrando mes previo en FCT (si existía) ...")
+        cur.execute(f"""
+            DELETE FROM {database}.{schema_gold}.FCT_TRIPS_YELLOW
+            WHERE trip_year={year} AND trip_month={month}
+        """)
+
+        # --- Armar SELECT de carga desde la vista enriched (usa comillas para columnas dinámicas)
+        pu_dt_select = f'y."{pu_dt}"' if pu_dt else "NULL::TIMESTAMP_NTZ"
+        do_dt_select = f'y."{do_dt}"' if do_dt else "NULL::TIMESTAMP_NTZ"
+
+        insert_sql = f"""
+        INSERT INTO {database}.{schema_gold}.FCT_TRIPS_YELLOW (
+            trip_id, service_type, trip_year, trip_month,
+            pickup_datetime, dropoff_datetime,
+            pu_location_id, do_location_id,
+            passenger_count, trip_distance, ratecode_id, payment_type,
+            fare_amount, extra, mta_tax, tip_amount, tolls_amount,
+            improvement_surcharge, total_amount,
+            pickup_zone, pickup_borough, dropoff_zone, dropoff_borough
+        )
+        SELECT
+            /* trip_id determinístico */
+            TO_VARCHAR(SHA2_HEX(
+                CONCAT('yellow|',
+                       TO_VARCHAR({pu_dt_select}), '|', TO_VARCHAR({do_dt_select}), '|',
+                       TO_VARCHAR(y."{pu_loc}"), '|', TO_VARCHAR(y."{do_loc}"), '|',
+                       TO_VARCHAR(y.total_amount)
+                ), 256))                                           AS trip_id,
+            'yellow'                                               AS service_type,
+            y.trip_year, y.trip_month,
+            {pu_dt_select}                                         AS pickup_datetime,
+            {do_dt_select}                                         AS dropoff_datetime,
+            y."{pu_loc}"                                           AS pu_location_id,
+            y."{do_loc}"                                           AS do_location_id,
+            y.passenger_count,
+            y.trip_distance,
+            y.ratecode_id,
+            y.payment_type,
+            y.fare_amount,
+            y.extra,
+            y.mta_tax,
+            y.tip_amount,
+            y.tolls_amount,
+            y.improvement_surcharge,
+            y.total_amount,
+            y.pickup_zone,
+            y.pickup_borough,
+            y.dropoff_zone,
+            y.dropoff_borough
+        FROM {database}.{schema_silver}.TRIPS_YELLOW_ENRICHED y
+        WHERE y.trip_year = {year}
+          AND y.trip_month = {month};
+        """
+        print("⬇️ Insertando en FCT_TRIPS_YELLOW ...")
+        cur.execute(insert_sql)
+
+        # Verificación
+        cur.execute(f"""
+            SELECT COUNT(*)
+            FROM {database}.{schema_gold}.FCT_TRIPS_YELLOW
+            WHERE trip_year={year} AND trip_month={month}
+        """)
+        n = cur.fetchone()[0]
+        print(f"📊 FCT_TRIPS_YELLOW {year}-{mm}: filas={n}")
+
+        return {"fct_rows": n}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert output.get("fct_rows", 0) >= 0

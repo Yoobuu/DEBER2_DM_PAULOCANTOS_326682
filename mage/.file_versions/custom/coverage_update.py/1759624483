@@ -1,0 +1,62 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import csv
+import os
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Agrega/actualiza una fila en /home/src/docs/coverage.csv
+    para el (service, year, month) actual. Lee conteos del bloque GOLD (args[0]).
+    """
+    # Variables (vienen del pipeline o del fallback del bloque GOLD previo)
+    pr = kwargs.get('pipeline_runtime') or {}
+    vars = pr.get('variables', {})
+    service = vars.get('service', 'yellow')
+    year = int(vars.get('year', 2019))
+    month = int(vars.get('month', 1))
+    mm = f"{month:02d}"
+    print(f"➡️ Vars coverage: service={service} year={year} month={month} mm={mm}")
+
+    # Métricas devueltas por el bloque GOLD (se pasan por args)
+    gold_metrics = args[0] if args else {}
+    rows_bronze = int(gold_metrics.get('rows_bronze', 0))
+    rows_silver = int(gold_metrics.get('rows_silver', 0))
+    rows_gold   = int(gold_metrics.get('rows_gold', 0))
+
+    # Ruta del CSV (debe existir la carpeta docs/)
+    coverage_path = '/home/src/docs/coverage.csv'
+    header = [
+        'service','year','month',
+        'bronze_loaded','silver_loaded','gold_loaded',
+        'rows_bronze','rows_silver','rows_gold'
+    ]
+    row = [
+        service, year, month,
+        'TRUE','TRUE','TRUE',
+        rows_bronze, rows_silver, rows_gold,
+    ]
+
+    file_exists = os.path.exists(coverage_path)
+
+    # Crea carpeta docs si no existe
+    os.makedirs('/home/src/docs', exist_ok=True)
+
+    # Si no existe el archivo, escribe encabezado primero
+    write_header = not file_exists
+    with open(coverage_path, 'a', newline='') as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow(row)
+
+    print(f"✅ Cobertura actualizada → {coverage_path}")
+    print("Fila agregada:", row)
+    return {'coverage_row': row}
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None

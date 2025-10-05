@@ -1,0 +1,125 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea la tabla BRONZE.YELLOW_PARQUET_RAW y copia datos desde el stage
+    correspondiente al mes y año indicados.
+    """
+    service = 'yellow'
+    year = 2019
+    month = 1
+    mm = f'{month:02d}'
+    stage_prefix = f"@STG_NYCTLC_PARQUET/service={service}/year={year}/month={mm}/"
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+
+    create_tbl = """
+    CREATE TABLE IF NOT EXISTS BRONZE.YELLOW_PARQUET_RAW (
+        v VARIANT,
+        run_id STRING,
+        ingest_ts TIMESTAMP_NTZ,
+        src_service STRING,
+        src_year NUMBER(4,0),
+        src_month NUMBER(2,0),
+        src_file STRING
+    );
+    """
+
+    copy_sql = f"""
+    COPY INTO BRONZE.YELLOW_PARQUET_RAW (v, run_id, ingest_ts, src_service, src_year, src_month, src_file)
+    FROM (
+        SELECT
+            $1,
+            'run_yellow_{year}_{mm}',
+            CURRENT_TIMESTAMP(),
+            '{service}',
+            {year},
+            {month},
+            METADATA$FILENAME
+        FROM {stage_prefix}
+    )
+    FILE_FORMAT = (TYPE = PARQUET)
+    ON_ERROR = 'ABORT_STATEMENT'
+    FORCE = FALSE;
+    """
+
+    count_sql = """
+    SELECT src_service, src_year, src_month, COUNT(*) AS rows_loaded
+    FROM BRONZE.YELLOW_PARQUET_RAW
+    WHERE src_service = 'yellow' AND src_year = 2019 AND src_month = 1
+    GROUP BY 1,2,3;
+    """
+
+    # Conexión (sin network_timeout) y sesión viva
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        login_timeout=20,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+
+    cur = conn.cursor()
+    try:
+        # Contexto
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema}")
+
+        # (Quitado) ALTER WAREHOUSE ... RESUME IF SUSPENDED  -> requiere OPERATE
+        # Timeout de sesión más holgado
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        # Crear tabla si no existe
+        print("▶ Creando tabla BRONZE.YELLOW_PARQUET_RAW (si no existe)...")
+        cur.execute(create_tbl)
+
+        # COPY (sin timeout del cliente)
+        print(f"▶ Ejecutando COPY desde {stage_prefix} ...")
+        cur.execute(copy_sql, timeout=0)
+        copy_result = cur.fetchall()
+        print("✅ COPY ejecutado correctamente.")
+        for r in copy_result:
+            print("   COPY:", r)
+
+        # Verificación
+        cur.execute(count_sql)
+        rows = cur.fetchall()
+        print("📊 Conteo en BRONZE.YELLOW_PARQUET_RAW (yellow 2019-01):")
+        for r in rows:
+            print("   ", r)
+
+        total = rows[0][3] if rows else 0
+        return {"rows_loaded": int(total)}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("rows_loaded", 0) > 0, "No se cargaron filas a BRONZE."

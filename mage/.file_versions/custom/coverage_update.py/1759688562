@@ -1,0 +1,94 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+import csv
+import os
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Actualiza /home/src/docs/coverage.csv con la fila (service, year, month)
+    del último GOLD. Prefiere year/month de gold_row; si no existe, usa Variables.
+    Es idempotente: reemplaza la fila existente para ese mes/servicio.
+    """
+    # --- Defaults desde Variables del pipeline ---
+    pr = kwargs.get('pipeline_runtime') or {}
+    vars_ = pr.get('variables', {})
+    service = vars_.get('service', 'yellow')
+    year = int(vars_.get('year', 2019))
+    month = int(vars_.get('month', 1))
+
+    # Acepta dict o lista o nada; si no es dict, usa {}
+    gold_metrics = args[0] if (args and isinstance(args[0], dict)) else {}
+    gold_row = gold_metrics.get('gold_row') if isinstance(gold_metrics, dict) else None
+
+    # ⚠️ Preferir mes/año reales que calculó GOLD
+    if gold_row:
+        try:
+            year = int(gold_row[0])
+            month = int(gold_row[1])
+        except Exception:
+            pass
+
+    mm = f"{month:02d}"
+    print(f"➡️ Vars coverage (efectivas): service={service} year={year} month={month} mm={mm}")
+
+    rows_bronze = int(gold_metrics.get('rows_bronze', 0))
+    rows_silver = int(gold_metrics.get('rows_silver', 0))
+    rows_gold   = int(gold_metrics.get('rows_gold', 0))
+
+    # --- Ruta / header ---
+    coverage_dir = '/home/src/docs'
+    coverage_path = f'{coverage_dir}/coverage.csv'
+    header = [
+        'service','year','month',
+        'bronze_loaded','silver_loaded','gold_loaded',
+        'rows_bronze','rows_silver','rows_gold'
+    ]
+    new_row = [
+        service, year, month,
+        'TRUE','TRUE','TRUE',
+        rows_bronze, rows_silver, rows_gold,
+    ]
+
+    os.makedirs(coverage_dir, exist_ok=True)
+
+    # --- Leer existente (si hay) ---
+    existing = []
+    if os.path.exists(coverage_path):
+        with open(coverage_path, 'r', newline='') as f:
+            r = csv.reader(f)
+            rows = list(r)
+            # Si el archivo ya tiene encabezado, conservarlo aparte
+            if rows and rows[0] and rows[0][0] == 'service':
+                existing = rows[1:]
+            else:
+                existing = rows
+
+    # --- Idempotencia: quitar cualquier fila previa del mismo service/year/month ---
+    filtered = []
+    for row in existing:
+        try:
+            s, y, m = row[0], int(row[1]), int(row[2])
+            if not (s == service and y == year and m == month):
+                filtered.append(row)
+        except Exception:
+            # Si hay filas corruptas, las mantenemos para no perder evidencia
+            filtered.append(row)
+
+    # --- Reescribir todo: header + filas previas + nueva fila ---
+    with open(coverage_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(filtered)
+        w.writerow(new_row)
+
+    print(f"✅ Cobertura actualizada → {coverage_path}")
+    print("Fila escrita:", new_row)
+    return {'coverage_row': new_row}
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None

@@ -1,0 +1,115 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Inserta datos desde BRONZE hacia SILVER.TRIPS_YELLOW,
+    usando variables service/year/month.
+    """
+    # --- fallback manual para ejecución local ---
+    if not kwargs.get('pipeline_runtime'):
+        kwargs['pipeline_runtime'] = {
+            'variables': {
+                'service': 'yellow',
+                'year': 2019,
+                'month': 2
+            }
+        }
+    # -------------------------------------------
+    pr = kwargs.get('pipeline_runtime') or {}
+    service = pr.get('variables', {}).get('service', 'yellow')
+    year = int(pr.get('variables', {}).get('year', 2019))
+    month = int(pr.get('variables', {}).get('month', 1))
+    mm = f'{month:02d}'
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_silver,
+        login_timeout=20,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_silver}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        print("▶ Creando tabla SILVER.TRIPS_YELLOW (si no existe)...")
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {database}.{schema_silver}.TRIPS_YELLOW AS
+        SELECT
+            v:value.pickup_datetime::timestamp_ntz AS pickup_datetime,
+            v:value.dropoff_datetime::timestamp_ntz AS dropoff_datetime,
+            v:value.passenger_count::int AS passenger_count,
+            v:value.trip_distance::float AS trip_distance,
+            v:value.total_amount::float AS total_amount,
+            src_service, src_year, src_month
+        FROM {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+        WHERE 1=2;
+        """
+        cur.execute(create_sql)
+
+        print(f"▶ Insertando datos desde BRONZE (yellow {year}-{mm})...")
+        insert_sql = f"""
+        INSERT INTO {database}.{schema_silver}.TRIPS_YELLOW
+        SELECT
+            v:value.pickup_datetime::timestamp_ntz,
+            v:value.dropoff_datetime::timestamp_ntz,
+            v:value.passenger_count::int,
+            v:value.trip_distance::float,
+            v:value.total_amount::float,
+            src_service, src_year, src_month
+        FROM {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+        WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month};
+        """
+        cur.execute(insert_sql)
+
+        print(f"✅ Insert ejecutado ({service} {year}-{mm}).")
+
+        count_sql = f"""
+        SELECT src_service, src_year, src_month, COUNT(*) AS rows_silver
+        FROM {database}.{schema_silver}.TRIPS_YELLOW
+        WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month}
+        GROUP BY 1,2,3;
+        """
+        cur.execute(count_sql)
+        rows = cur.fetchall()
+        for r in rows:
+            print("📊 Filas en SILVER:", r)
+
+        total = rows[0][3] if rows else 0
+        return {"rows_silver": int(total), "service": service, "year": year, "month": month}
+
+    finally:
+        cur.close()
+        conn.close()
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("rows_silver", 0) > 0, "No se insertaron filas en SILVER."

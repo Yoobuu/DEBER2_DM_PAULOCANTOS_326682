@@ -1,0 +1,126 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Genera métricas mensuales desde SILVER.TRIPS_YELLOW hacia GOLD.TRIPS_YELLOW_MONTHLY,
+    devolviendo además los conteos bronze/silver/gold para coverage_update.
+    """
+    pr = kwargs.get('pipeline_runtime') or {}
+    vars = pr.get('variables', {})
+    service = vars.get('service', 'yellow')
+    year = int(vars.get('year', 2019))
+    month = int(vars.get('month', 1))
+    mm = f"{month:02d}"
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+   
+    # Secrets Snowflake
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+    schema_gold = get_secret_value('SNOWFLAKE_SCHEMA_GOLD')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_gold,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_gold}")
+
+        print("▶ Creando tabla GOLD.TRIPS_YELLOW_MONTHLY (si no existe)...")
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {database}.{schema_gold}.TRIPS_YELLOW_MONTHLY (
+            trip_year INT,
+            trip_month INT,
+            rides BIGINT,
+            total_distance_miles FLOAT,
+            revenue NUMERIC(18,2),
+            tips NUMERIC(18,2),
+            avg_total_amount NUMERIC(18,2),
+            created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        );
+        """)
+
+        print("▶ Borrando datos previos del mes...")
+        cur.execute(f"""
+        DELETE FROM {database}.{schema_gold}.TRIPS_YELLOW_MONTHLY
+        WHERE trip_year = {year} AND trip_month = {month};
+        """)
+
+        print(f"▶ Insertando métricas {year}-{mm} desde SILVER.TRIPS_YELLOW...")
+        cur.execute(f"""
+        INSERT INTO {database}.{schema_gold}.TRIPS_YELLOW_MONTHLY
+            (trip_year, trip_month, rides, total_distance_miles, revenue, tips, avg_total_amount)
+        SELECT
+            {year}, {month},
+            COUNT(*),
+            COALESCE(SUM(trip_distance),0),
+            COALESCE(SUM(total_amount),0),
+            COALESCE(SUM(tip_amount),0),
+            COALESCE(AVG(total_amount),0)
+        FROM {database}.{schema_silver}.TRIPS_YELLOW
+        WHERE trip_year = {year} AND trip_month = {month};
+        """)
+
+        cur.execute(f"""
+        SELECT COUNT(*) FROM {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+        WHERE src_year={year} AND src_month={month};
+        """)
+        bronze_count = cur.fetchone()[0]
+
+        cur.execute(f"""
+        SELECT COUNT(*) FROM {database}.{schema_silver}.TRIPS_YELLOW
+        WHERE trip_year={year} AND trip_month={month};
+        """)
+        silver_count = cur.fetchone()[0]
+
+        cur.execute(f"""
+        SELECT * FROM {database}.{schema_gold}.TRIPS_YELLOW_MONTHLY
+        WHERE trip_year={year} AND trip_month={month};
+        """)
+        gold_row = cur.fetchone()
+
+        print("📊 GOLD:", gold_row)
+        print("✅ GOLD mensual generado/actualizado.")
+
+        return {
+            "rows_bronze": bronze_count,
+            "rows_silver": silver_count,
+            "rows_gold": gold_row[2] if gold_row else 0,
+            "gold_row": gold_row,
+        }
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert output.get("gold_row") is not None

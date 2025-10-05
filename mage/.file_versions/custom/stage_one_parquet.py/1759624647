@@ -1,0 +1,128 @@
+# Mantén el header del template
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+import os
+import pathlib
+from urllib.request import urlopen
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Descarga 1 parquet (yellow 2019-01) a /home/src/data/nyctlc/yellow/
+    y lo sube al stage @STG_NYCTLC_PARQUET en la ruta:
+      service=yellow/year=2019/month=01/
+    Luego lista el stage para verificar.
+    """
+    # 1) Parámetros del archivo ejemplo (puedes cambiar a otro mes/año luego)
+    # --- fallback manual para ejecución local ---
+    if not kwargs.get('pipeline_runtime'):
+        kwargs['pipeline_runtime'] = {
+            'variables': {
+                'service': 'yellow',
+                'year': 2019,
+                'month': 3
+            }
+        }
+    # -------------------------------------------
+
+    pr = kwargs.get('pipeline_runtime') or {}
+    service = pr.get('variables', {}).get('service', 'yellow')
+    year = int(pr.get('variables', {}).get('year', 2019))
+    month = int(pr.get('variables', {}).get('month', 1))
+    mm = f'{month:02d}'
+    url = f'https://d37ci6vzurychx.cloudfront.net/trip-data/{service}_tripdata_{year}-{mm}.parquet'
+    stage_subdir = f"service={service}/year={year}/month={mm}/"
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+
+
+    # 2) Rutas locales
+    base_dir = pathlib.Path('/home/src/data/nyctlc') / service
+    base_dir.mkdir(parents=True, exist_ok=True)
+    local_path = base_dir / f'{service}_tripdata_{year}-{mm}.parquet'
+
+    print(f'🔽 Descargando: {url}')
+    with urlopen(url) as r, open(local_path, 'wb') as f:
+        chunk = r.read()
+        f.write(chunk)
+
+    size_mb = round(local_path.stat().st_size / (1024*1024), 2)
+    print(f'✅ Archivo descargado en {local_path} ({size_mb} MB)')
+
+    # 3) Conexión a Snowflake con Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+
+    stage_subdir = f"service={service}/year={year}/month={mm}/"
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        login_timeout=20,
+        network_timeout=20,
+        client_session_keep_alive=False,
+        authenticator='snowflake',
+        insecure_mode=True,   # <— OMITIR validación OCSP SOLO en este bloque
+    )
+
+    cur = conn.cursor()
+
+    try:
+        # Asegura contexto (por si acaso)
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema}")
+
+        # 4) Subir al stage con PUT file://
+        print('☁️  Subiendo al stage @STG_NYCTLC_PARQUET ...')
+        put_sql = (
+            f"PUT file://{local_path} @STG_NYCTLC_PARQUET/{stage_subdir} "
+            "AUTO_COMPRESS=FALSE OVERWRITE=TRUE PARALLEL=1"              
+        )
+        print(put_sql)
+        cur.execute(put_sql)
+        put_result = cur.fetchall()  # opcional: ver detalles
+        print('✅ Subida completada.')
+
+        # 5) Verificar contenido en el stage
+        list_sql = f"LIST @STG_NYCTLC_PARQUET/{stage_subdir}"
+        cur.execute(list_sql)
+        files = cur.fetchall()
+        print(f'📦 Archivos en {stage_subdir}: {len(files)}')
+        for row in files[:3]:
+            print(' -', row[0])  # nombre (ruta) de los primeros 3
+
+        return {
+            "local_file": str(local_path),
+            "size_mb": size_mb,
+            "stage_prefix": stage_subdir,
+            "files_in_stage": len(files),
+        }
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("files_in_stage", 0) >= 1, "No se subió ningún archivo al stage."

@@ -1,0 +1,14 @@
+services:
+  mage:
+    image: mageai/mageai:latest
+    container_name: mage-nyctlc
+    environment:
+      - MAGE_PROJECT_PATH=/home/src
+    volumes:
+      - ./mage:/home/src
+      - ./dbt:/home/src/dbt
+      - ./notebooks:/home/src/notebooks
+      - ./data:/home/src/data
+    ports:
+      - "6789:6789"
+    command: mage start /home/src --host 0.0.0.0 --port 6789

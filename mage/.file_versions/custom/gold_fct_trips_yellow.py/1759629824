@@ -1,0 +1,210 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea GOLD.FCT_TRIPS_YELLOW (1 fila = 1 viaje) y carga el mes indicado.
+    Auto-detecta nombres reales en SILVER.TRIPS_YELLOW para todas las columnas clave.
+    Idempotente por mes (DELETE + INSERT). Aplica CLUSTER BY.
+    """
+    # Variables
+    pr = kwargs.get('pipeline_runtime') or {}
+    v = pr.get('variables', {})
+    year = int(v.get('year', 2019))
+    month = int(v.get('month', 3))   # ← por defecto marzo (tú lo tienes cargado)
+    mm = f'{month:02d}'
+    print(f"➡️ Carga FCT_TRIPS_YELLOW → year={year} month={month} mm={mm}")
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+    schema_gold = get_secret_value('SNOWFLAKE_SCHEMA_GOLD')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_gold,
+        client_session_keep_alive=True,
+        login_timeout=30,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_gold}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1200")
+
+        # --- Column discovery en SILVER.TRIPS_YELLOW ---
+        cur.execute(f"""
+            SELECT COLUMN_NAME
+            FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = 'TRIPS_YELLOW'
+        """, (schema_silver,))
+        cols = [r[0] for r in cur.fetchall()]
+        U = {c.upper(): c for c in cols}
+
+        def pick(*cands, required=False):
+            for c in cands:
+                if c in U:
+                    return U[c]
+            if required:
+                raise Exception(f"No se encontraron columnas: {cands}")
+            return None
+
+        # IDs de zona (ya vimos que son PU_LOCATION_ID / DO_LOCATION_ID en tu caso)
+        pu_loc = pick('PULOCATIONID', 'PU_LOCATION_ID', required=True)
+        do_loc = pick('DOLOCATIONID', 'DO_LOCATION_ID', required=True)
+
+        # Datetimes (si no existen normalizados, devolvemos None → se usa NULL en el SELECT)
+        pu_dt  = pick('PICKUP_DATETIME', 'TPEP_PICKUP_DATETIME', 'LPEP_PICKUP_DATETIME')
+        do_dt  = pick('DROPOFF_DATETIME', 'TPEP_DROPOFF_DATETIME', 'LPEP_DROPOFF_DATETIME')
+
+        # Métricas / dimensiones comunes (opcionales, caerán en 0/NULL si no existen)
+        passenger_count       = pick('PASSENGER_COUNT', 'PASSENGERCOUNT')
+        trip_distance         = pick('TRIP_DISTANCE', 'TRIPDISTANCE')
+        ratecode_id           = pick('RATECODE_ID', 'RATECODEID', 'RATE_CODE_ID')
+        payment_type          = pick('PAYMENT_TYPE', 'PAYMENTTYPE')
+        fare_amount           = pick('FARE_AMOUNT', 'FAREAMOUNT')
+        extra                 = pick('EXTRA')
+        mta_tax               = pick('MTA_TAX', 'MTATAX')
+        tip_amount            = pick('TIP_AMOUNT', 'TIPAMOUNT')
+        tolls_amount          = pick('TOLLS_AMOUNT', 'TOLLSAMOUNT')
+        improvement_surcharge = pick('IMPROVEMENT_SURCHARGE', 'IMPROVEMENTSURCHARGE')
+        total_amount          = pick('TOTAL_AMOUNT', 'TOTALAMOUNT')
+
+        print("🔎 Detectadas:",
+              f"PU_LOC='{pu_loc}' DO_LOC='{do_loc}' PU_DT='{pu_dt}' DO_DT='{do_dt}' |",
+              f"ratecode='{ratecode_id}' payment='{payment_type}'")
+
+        # Helpers para armar SELECT seguro (si falta, usar NULL/0)
+        def q(col):   return f'y.\"{col}\"' if col else 'NULL'
+        def qf(col):  return f'COALESCE({q(col)}, 0)'   # numérico
+        def qts(col): return f'{q(col)}::TIMESTAMP_NTZ' if col else 'NULL::TIMESTAMP_NTZ'
+
+        # --- Crear tabla FCT (clustered)
+        print("▶ Creando tabla GOLD.FCT_TRIPS_YELLOW (si no existe) ...")
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {database}.{schema_gold}.FCT_TRIPS_YELLOW (
+            trip_id                STRING,
+            service_type           STRING,
+            trip_year              INT,
+            trip_month             INT,
+            pickup_datetime        TIMESTAMP_NTZ,
+            dropoff_datetime       TIMESTAMP_NTZ,
+            pu_location_id         INT,
+            do_location_id         INT,
+            passenger_count        FLOAT,
+            trip_distance          FLOAT,
+            ratecode_id            FLOAT,
+            payment_type           FLOAT,
+            fare_amount            NUMERIC(18,2),
+            extra                  NUMERIC(18,2),
+            mta_tax                NUMERIC(18,2),
+            tip_amount             NUMERIC(18,2),
+            tolls_amount           NUMERIC(18,2),
+            improvement_surcharge  NUMERIC(18,2),
+            total_amount           NUMERIC(18,2),
+            pickup_zone            STRING,
+            pickup_borough         STRING,
+            dropoff_zone           STRING,
+            dropoff_borough        STRING,
+            created_at             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        CLUSTER BY (trip_year, trip_month, pu_location_id);
+        """)
+
+        # --- Idempotencia por mes
+        print("🧹 Borrando mes previo en FCT (si existía) ...")
+        cur.execute(f"""
+            DELETE FROM {database}.{schema_gold}.FCT_TRIPS_YELLOW
+            WHERE trip_year={year} AND trip_month={month}
+        """)
+
+        # --- Insert desde la vista enriquecida
+        pu_dt_sel = qts(pu_dt)
+        do_dt_sel = qts(do_dt)
+
+        insert_sql = f"""
+        INSERT INTO {database}.{schema_gold}.FCT_TRIPS_YELLOW (
+            trip_id, service_type, trip_year, trip_month,
+            pickup_datetime, dropoff_datetime,
+            pu_location_id, do_location_id,
+            passenger_count, trip_distance, ratecode_id, payment_type,
+            fare_amount, extra, mta_tax, tip_amount, tolls_amount,
+            improvement_surcharge, total_amount,
+            pickup_zone, pickup_borough, dropoff_zone, dropoff_borough
+        )
+        SELECT
+            /* trip_id determinístico */
+            TO_VARCHAR(SHA2_HEX(
+                CONCAT('yellow|',
+                       TO_VARCHAR({pu_dt_sel}), '|', TO_VARCHAR({do_dt_sel}), '|',
+                       TO_VARCHAR({q(pu_loc)}), '|', TO_VARCHAR({q(do_loc)}), '|',
+                       TO_VARCHAR({q(total_amount)})
+                ), 256))                                           AS trip_id,
+            'yellow'                                               AS service_type,
+            y.trip_year, y.trip_month,
+            {pu_dt_sel}                                            AS pickup_datetime,
+            {do_dt_sel}                                            AS dropoff_datetime,
+            {q(pu_loc)}                                            AS pu_location_id,
+            {q(do_loc)}                                            AS do_location_id,
+            {qf(passenger_count)}                                  AS passenger_count,
+            {qf(trip_distance)}                                    AS trip_distance,
+            {qf(ratecode_id)}                                      AS ratecode_id,
+            {qf(payment_type)}                                     AS payment_type,
+            {qf(fare_amount)}                                      AS fare_amount,
+            {qf(extra)}                                            AS extra,
+            {qf(mta_tax)}                                          AS mta_tax,
+            {qf(tip_amount)}                                       AS tip_amount,
+            {qf(tolls_amount)}                                     AS tolls_amount,
+            {qf(improvement_surcharge)}                            AS improvement_surcharge,
+            {qf(total_amount)}                                     AS total_amount,
+            y.pickup_zone,
+            y.pickup_borough,
+            y.dropoff_zone,
+            y.dropoff_borough
+        FROM {database}.{schema_silver}.TRIPS_YELLOW_ENRICHED y
+        WHERE y.trip_year = {year}
+          AND y.trip_month = {month};
+        """
+        print("⬇️ Insertando en FCT_TRIPS_YELLOW ...")
+        cur.execute(insert_sql)
+
+        cur.execute(f"""
+            SELECT COUNT(*)
+            FROM {database}.{schema_gold}.FCT_TRIPS_YELLOW
+            WHERE trip_year={year} AND trip_month={month}
+        """)
+        n = cur.fetchone()[0]
+        print(f"📊 FCT_TRIPS_YELLOW {year}-{mm}: filas={n}")
+        return {"fct_rows": n}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert output.get("fct_rows", 0) >= 0

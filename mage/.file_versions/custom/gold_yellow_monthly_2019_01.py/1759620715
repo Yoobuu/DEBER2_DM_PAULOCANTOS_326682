@@ -1,0 +1,116 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea/asegura GOLD.TRIPS_YELLOW_MONTHLY y carga métricas de 2019-01
+    desde SILVER.TRIPS_YELLOW.
+    """
+
+    service = 'yellow'
+    year = 2019
+    month = 1
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+    gold = get_secret_value('SNOWFLAKE_SCHEMA_GOLD')
+
+    create_tbl = f"""
+    CREATE TABLE IF NOT EXISTS {database}.{gold}.TRIPS_YELLOW_MONTHLY (
+        trip_year            INT,
+        trip_month           INT,
+        rides                BIGINT,
+        total_distance_miles FLOAT,
+        revenue              NUMERIC(18,2),
+        tips                 NUMERIC(18,2),
+        avg_total_amount     NUMERIC(18,2),
+        created_at           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    );
+    """
+
+    delete_sql = f"""
+    DELETE FROM {database}.{gold}.TRIPS_YELLOW_MONTHLY
+    WHERE trip_year = {year} AND trip_month = {month};
+    """
+
+    insert_sql = f"""
+    INSERT INTO {database}.{gold}.TRIPS_YELLOW_MONTHLY (
+        trip_year, trip_month, rides, total_distance_miles,
+        revenue, tips, avg_total_amount
+    )
+    SELECT
+        {year} AS trip_year,
+        {month} AS trip_month,
+        COUNT(*) AS rides,
+        COALESCE(SUM(trip_distance), 0) AS total_distance_miles,
+        COALESCE(SUM(total_amount), 0)   AS revenue,
+        COALESCE(SUM(tip_amount), 0)     AS tips,
+        COALESCE(AVG(total_amount), 0)   AS avg_total_amount
+    FROM {database}.{silver}.TRIPS_YELLOW
+    WHERE trip_year = {year} AND trip_month = {month};
+    """
+
+    check_sql = f"""
+    SELECT *
+    FROM {database}.{gold}.TRIPS_YELLOW_MONTHLY
+    WHERE trip_year = {year} AND trip_month = {month};
+    """
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=gold,
+        login_timeout=20,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {gold}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        print("▶ Creando tabla GOLD.TRIPS_YELLOW_MONTHLY (si no existe)...")
+        cur.execute(create_tbl)
+
+        print("▶ Borrando datos previos del mes (idempotencia)...")
+        cur.execute(delete_sql)
+
+        print("▶ Insertando métricas 2019-01 desde SILVER...")
+        cur.execute(insert_sql, timeout=0)
+        print("✅ Insert GOLD ejecutado.")
+
+        cur.execute(check_sql)
+        row = cur.fetchone()
+        print("📊 GOLD 2019-01:", row)
+        return {"gold_row": row}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("gold_row") is not None, "No se generó la fila GOLD para 2019-01."

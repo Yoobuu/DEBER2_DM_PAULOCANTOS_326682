@@ -1,0 +1,135 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea/asegura la tabla SILVER.TRIPS_YELLOW con tipos explícitos
+    y carga datos desde BRONZE.YELLOW_PARQUET_RAW (solo 2019-01).
+    """
+
+    service = 'yellow'
+    year = 2019
+    month = 1
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+
+    create_tbl = f"""
+    CREATE TABLE IF NOT EXISTS {database}.{silver}.TRIPS_YELLOW (
+        vendor_id            INT,
+        pickup_ts            TIMESTAMP_NTZ,
+        dropoff_ts           TIMESTAMP_NTZ,
+        passenger_count      INT,
+        trip_distance        FLOAT,
+        rate_code_id         INT,
+        pu_location_id       INT,
+        do_location_id       INT,
+        payment_type         INT,
+        fare_amount          NUMERIC(10,2),
+        extra                NUMERIC(10,2),
+        mta_tax              NUMERIC(10,2),
+        tip_amount           NUMERIC(10,2),
+        tolls_amount         NUMERIC(10,2),
+        improvement_surcharge NUMERIC(10,2),
+        total_amount         NUMERIC(10,2),
+        congestion_surcharge NUMERIC(10,2),
+        trip_year            INT,
+        trip_month           INT,
+        src_file             STRING,
+        loaded_at            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    );
+    """
+
+    insert_sql = f"""
+    INSERT INTO {database}.{silver}.TRIPS_YELLOW (
+        vendor_id, pickup_ts, dropoff_ts, passenger_count, trip_distance,
+        rate_code_id, pu_location_id, do_location_id, payment_type,
+        fare_amount, extra, mta_tax, tip_amount, tolls_amount,
+        improvement_surcharge, total_amount, congestion_surcharge,
+        trip_year, trip_month, src_file
+    )
+    SELECT
+        v:VendorID::INT                                   AS vendor_id,
+        v:tpep_pickup_datetime::TIMESTAMP_NTZ             AS pickup_ts,
+        v:tpep_dropoff_datetime::TIMESTAMP_NTZ            AS dropoff_ts,
+        v:passenger_count::INT                            AS passenger_count,
+        v:trip_distance::FLOAT                            AS trip_distance,
+        v:RatecodeID::INT                                 AS rate_code_id,
+        v:PULocationID::INT                               AS pu_location_id,
+        v:DOLocationID::INT                               AS do_location_id,
+        v:payment_type::INT                               AS payment_type,
+        v:fare_amount::NUMERIC(10,2)                      AS fare_amount,
+        v:extra::NUMERIC(10,2)                            AS extra,
+        v:mta_tax::NUMERIC(10,2)                          AS mta_tax,
+        v:tip_amount::NUMERIC(10,2)                       AS tip_amount,
+        v:tolls_amount::NUMERIC(10,2)                     AS tolls_amount,
+        v:improvement_surcharge::NUMERIC(10,2)            AS improvement_surcharge,
+        v:total_amount::NUMERIC(10,2)                     AS total_amount,
+        v:congestion_surcharge::NUMERIC(10,2)             AS congestion_surcharge,
+        src_year, src_month, src_file
+    FROM {database}.{bronze}.YELLOW_PARQUET_RAW
+    WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month};
+    """
+
+    count_sql = f"""
+    SELECT COUNT(*)
+    FROM {database}.{silver}.TRIPS_YELLOW
+    WHERE trip_year = {year} AND trip_month = {month};
+    """
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=silver,
+        login_timeout=20,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {silver}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        print("▶ Creando tabla SILVER.TRIPS_YELLOW (si no existe)...")
+        cur.execute(create_tbl)
+
+        print("▶ Insertando datos desde BRONZE (yellow 2019-01)...")
+        cur.execute(insert_sql, timeout=0)
+        print("✅ Insert ejecutado.")
+
+        cur.execute(count_sql)
+        n = cur.fetchone()[0]
+        print(f"📊 Filas en SILVER.TRIPS_YELLOW para 2019-01: {n}")
+        return {"rows_silver_2019_01": int(n)}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("rows_silver_2019_01", 0) > 0, "No se insertaron filas en SILVER para 2019-01."

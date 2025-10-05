@@ -1,0 +1,4 @@
+service,year,month,bronze_loaded,silver_loaded,gold_loaded,rows_bronze,rows_silver,rows_gold
+yellow,2019,2,TRUE,TRUE,TRUE,7049370,7049370,7049370
+yellow,2019,3,TRUE,TRUE,TRUE,7866620,7866620,7866620
+yellow,2019,1,TRUE,TRUE,TRUE,0,0,0

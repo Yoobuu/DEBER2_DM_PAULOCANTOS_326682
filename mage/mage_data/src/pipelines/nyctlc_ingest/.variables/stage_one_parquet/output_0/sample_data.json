@@ -1,0 +1,1 @@
+{"local_file": "/home/src/data/nyctlc/green/green_tripdata_2019-01.parquet", "size_mb": 10.56, "stage_prefix": "service=green/year=2019/month=01/", "files_in_stage": 1, "dest_table": "BRONZE.GREEN_PARQUET_RAW", "run_id": "run_b57f1ed407ac", "rows_inserted": 672105}

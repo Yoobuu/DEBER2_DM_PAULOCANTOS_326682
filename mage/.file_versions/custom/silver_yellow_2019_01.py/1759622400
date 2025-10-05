@@ -1,0 +1,182 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Hotfix de una sola ejecución:
+    - Intenta elevar rol (ACCOUNTADMIN -> ROLE_DM_ADMIN -> rol actual)
+    - DROP TABLE SILVER.TRIPS_YELLOW
+    - CREATE TABLE SILVER.TRIPS_YELLOW con el esquema compacto correcto
+    - Otorga permisos a ROLE_DM_SVC
+    - Vuelve a ROLE_DM_SVC y hace INSERT de service/year/month
+    """
+    # --- fallback manual para ejecución local (ajusta aquí si quieres otro mes) ---
+    if not kwargs.get('pipeline_runtime'):
+        kwargs['pipeline_runtime'] = {
+            'variables': {
+                'service': 'yellow',
+                'year': 2019,
+                'month': 2,
+            }
+        }
+    # ------------------------------------------------------------------------------
+
+    pr = kwargs.get('pipeline_runtime') or {}
+    service = pr.get('variables', {}).get('service', 'yellow')
+    year = int(pr.get('variables', {}).get('year', 2019))
+    month = int(pr.get('variables', {}).get('month', 1))
+    mm = f'{month:02d}'
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role_dm_svc = get_secret_value('SNOWFLAKE_ROLE')  # ROLE_DM_SVC
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_silver,
+        client_session_keep_alive=True,
+        login_timeout=30,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        # 1) Intentar elevar rol
+        elevated = None
+        for candidate in ["ACCOUNTADMIN", "ROLE_DM_ADMIN", role_dm_svc]:
+            try:
+                cur.execute(f"USE ROLE {candidate}")
+                elevated = candidate
+                print(f"🔐 Rol en uso para mantenimiento: {candidate}")
+                break
+            except Exception as e:
+                print(f"   (No pude usar rol {candidate}: {e})")
+                continue
+        if elevated is None:
+            raise Exception("No se pudo asignar ningún rol para mantenimiento.")
+
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_silver}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 600")
+
+        # 2) DROP TABLE si existe
+        print("🧹 DROP TABLE IF EXISTS SILVER.TRIPS_YELLOW ...")
+        cur.execute(f"DROP TABLE IF EXISTS {database}.{schema_silver}.TRIPS_YELLOW")
+
+        # 3) CREATE TABLE con esquema correcto (compacto)
+        print("🧱 CREATE TABLE SILVER.TRIPS_YELLOW ...")
+        create_sql = f"""
+        CREATE TABLE {database}.{schema_silver}.TRIPS_YELLOW (
+            vendor_id             INT,
+            pickup_ts             TIMESTAMP_NTZ,
+            dropoff_ts            TIMESTAMP_NTZ,
+            passenger_count       INT,
+            trip_distance         FLOAT,
+            rate_code_id          INT,
+            pu_location_id        INT,
+            do_location_id        INT,
+            payment_type          INT,
+            fare_amount           NUMERIC(10,2),
+            extra                 NUMERIC(10,2),
+            mta_tax               NUMERIC(10,2),
+            tip_amount            NUMERIC(10,2),
+            tolls_amount          NUMERIC(10,2),
+            improvement_surcharge NUMERIC(10,2),
+            total_amount          NUMERIC(10,2),
+            congestion_surcharge  NUMERIC(10,2),
+            trip_year             INT,
+            trip_month            INT,
+            src_file              STRING,
+            loaded_at             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        );
+        """
+        cur.execute(create_sql)
+
+        # 4) Permisos mínimos a ROLE_DM_SVC (uso/insert/select)
+        print("🎟️ Concediendo privilegios a ROLE_DM_SVC ...")
+        cur.execute(f"GRANT USAGE ON SCHEMA {database}.{schema_silver} TO ROLE {role_dm_svc}")
+        cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {database}.{schema_silver}.TRIPS_YELLOW TO ROLE {role_dm_svc}")
+
+        # 5) Volver al rol de servicio para el insert
+        cur.execute(f"USE ROLE {role_dm_svc}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_silver}")
+
+        # 6) Insert desde BRONZE (mapeo mínimo seguro; puedes ampliarlo luego)
+        print(f"⬇️ Insertando datos de BRONZE (service={service} {year}-{mm}) ...")
+        insert_sql = f"""
+        INSERT INTO {database}.{schema_silver}.TRIPS_YELLOW (
+            vendor_id, pickup_ts, dropoff_ts, passenger_count, trip_distance,
+            rate_code_id, pu_location_id, do_location_id, payment_type,
+            fare_amount, extra, mta_tax, tip_amount, tolls_amount,
+            improvement_surcharge, total_amount, congestion_surcharge,
+            trip_year, trip_month, src_file
+        )
+        SELECT
+            v:VendorID::INT,
+            v:tpep_pickup_datetime::TIMESTAMP_NTZ,
+            v:tpep_dropoff_datetime::TIMESTAMP_NTZ,
+            v:passenger_count::INT,
+            v:trip_distance::FLOAT,
+            v:RatecodeID::INT,
+            v:PULocationID::INT,
+            v:DOLocationID::INT,
+            v:payment_type::INT,
+            v:fare_amount::NUMERIC(10,2),
+            v:extra::NUMERIC(10,2),
+            v:mta_tax::NUMERIC(10,2),
+            v:tip_amount::NUMERIC(10,2),
+            v:tolls_amount::NUMERIC(10,2),
+            v:improvement_surcharge::NUMERIC(10,2),
+            v:total_amount::NUMERIC(10,2),
+            v:congestion_surcharge::NUMERIC(10,2),
+            src_year, src_month, src_file
+        FROM {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+        WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month};
+        """
+        cur.execute(insert_sql)
+
+        # 7) Conteo de verificación
+        count_sql = f"""
+        SELECT src_service, src_year, src_month, COUNT(*) AS rows_silver
+        FROM {database}.{schema_silver}.TRIPS_YELLOW
+        WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month}
+        GROUP BY 1,2,3;
+        """
+        cur.execute(count_sql)
+        rows = cur.fetchall()
+        for r in rows:
+            print("📊 Filas en SILVER:", r)
+
+        total = rows[0][3] if rows else 0
+        print("✅ SILVER recreada y cargada.")
+        return {"rows_silver": int(total), "role_used": elevated}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("rows_silver", 0) > 0, "No se insertaron filas en SILVER."

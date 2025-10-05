@@ -1,0 +1,1 @@
+cd /home/src/dbt && DBT_PROFILES_DIR=/home/src/dbt dbt build

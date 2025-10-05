@@ -1,0 +1,33 @@
+version: 2
+
+models:
+  - name: silver_trips_unified
+    description: "Unificación y limpieza de viajes Yellow y Green con zonas enriquecidas"
+    tests:
+      - not_null:
+          column_name: trip_hash
+
+  - name: dim_zone
+    description: "Dimensión de zonas de taxi con borough y nombre"
+    tests:
+      - unique:
+          column_name: zone_sk
+      - not_null:
+          column_name: zone_sk
+
+  - name: fct_trips
+    description: "Tabla de hechos de viajes. 1 fila = 1 viaje"
+    tests:
+      - not_null:
+          column_name: trip_hash
+    columns:
+      - name: pu_zone_sk
+        tests:
+          - relationships:
+              to: ref('dim_zone')
+              field: zone_sk
+      - name: do_zone_sk
+        tests:
+          - relationships:
+              to: ref('dim_zone')
+              field: zone_sk

@@ -1,0 +1,57 @@
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+from mage_ai.data_preparation.decorators import custom
+import snowflake.connector
+
+@custom
+def execute(*args, **kwargs):
+    print("🔍 Intentando conectar con Snowflake...")
+
+    # Leer secrets desde Mage
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')  # BRONZE
+
+    try:
+        conn = snowflake.connector.connect(
+            user=user,
+            password=password,
+            account=account,      # p.ej. xpc24435.us-east-1
+            role=role,
+            warehouse=warehouse,
+            database=database,
+            schema=schema,
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT CURRENT_VERSION(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA();")
+        v, r, d, s = cur.fetchone()
+
+        print("✅ Conexión exitosa a Snowflake!")
+        print(f"Versión: {v}")
+        print(f"Rol actual: {r}")
+        print(f"Base de datos: {d}")
+        print(f"Esquema: {s}")
+
+        # Devuelve algo (opcional) para que quede registro estructurado
+        return {
+            'version': v,
+            'role': r,
+            'database': d,
+            'schema': s,
+        }
+
+    except Exception as e:
+        print("❌ Error al conectar a Snowflake:")
+        print(e)
+        # Propaga el error para que quede rojo en el run
+        raise
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass

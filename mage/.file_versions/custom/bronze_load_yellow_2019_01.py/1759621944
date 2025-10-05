@@ -1,0 +1,134 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Carga desde el stage a BRONZE.YELLOW_PARQUET_RAW usando Variables del pipeline:
+    service/year/month.
+    """
+    # ←← Leer variables del pipeline
+    # --- fallback manual para ejecución local ---
+    if not kwargs.get('pipeline_runtime'):
+        kwargs['pipeline_runtime'] = {
+            'variables': {
+                'service': 'yellow',
+                'year': 2019,
+                'month': 2
+            }
+        }
+    # -------------------------------------------
+
+    pr = kwargs.get('pipeline_runtime') or {}
+    service = pr.get('variables', {}).get('service', 'yellow')
+    year = int(pr.get('variables', {}).get('year', 2019))
+    month = int(pr.get('variables', {}).get('month', 1))
+    mm = f'{month:02d}'
+    print(f"➡️ Vars: service={service} year={year} month={month} mm={mm}")
+
+
+    stage_prefix = f"@STG_NYCTLC_PARQUET/service={service}/year={year}/month={mm}/"
+
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')  # BRONZE
+
+    create_tbl = f"""
+    CREATE TABLE IF NOT EXISTS {database}.{schema_bronze}.YELLOW_PARQUET_RAW (
+        v VARIANT,
+        run_id STRING,
+        ingest_ts TIMESTAMP_NTZ,
+        src_service STRING,
+        src_year NUMBER(4,0),
+        src_month NUMBER(2,0),
+        src_file STRING
+    );
+    """
+
+    copy_sql = f"""
+    COPY INTO {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+      (v, run_id, ingest_ts, src_service, src_year, src_month, src_file)
+    FROM (
+      SELECT
+        $1,
+        'run_{service}_{year}_{mm}',
+        CURRENT_TIMESTAMP(),
+        '{service}',
+        {year},
+        {month},
+        METADATA$FILENAME
+      FROM {stage_prefix}
+    )
+    FILE_FORMAT = (TYPE = PARQUET)
+    ON_ERROR = 'ABORT_STATEMENT'
+    FORCE = FALSE;
+    """
+
+    count_sql = f"""
+    SELECT src_service, src_year, src_month, COUNT(*) AS rows_loaded
+    FROM {database}.{schema_bronze}.YELLOW_PARQUET_RAW
+    WHERE src_service = '{service}' AND src_year = {year} AND src_month = {month}
+    GROUP BY 1,2,3;
+    """
+
+    # Conexión sin network_timeout y con sesión viva
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_bronze,
+        login_timeout=20,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        # Contexto
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_bronze}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        print(f"▶ Creando tabla BRONZE.YELLOW_PARQUET_RAW (si no existe)...")
+        cur.execute(create_tbl)
+
+        print(f"▶ COPY desde {stage_prefix} (service={service}, {year}-{mm}) ...")
+        cur.execute(copy_sql, timeout=0)
+        copy_result = cur.fetchall()
+        print("✅ COPY ejecutado.")
+        for r in copy_result:
+            print("   COPY:", r)
+
+        cur.execute(count_sql)
+        rows = cur.fetchall()
+        for r in rows:
+            print("📊 Conteo BRONZE:", r)
+
+        total = rows[0][3] if rows else 0
+        return {"rows_loaded": int(total), "service": service, "year": year, "month": month}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "No hubo output."
+    assert output.get("rows_loaded", 0) > 0, "No se cargaron filas a BRONZE."

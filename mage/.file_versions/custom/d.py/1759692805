@@ -1,0 +1,36 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import os, subprocess
+
+@custom
+def transform_custom(*args, **kwargs):
+    # 1) Cargar credenciales desde Secrets y ponerlas en el entorno del proceso hijo
+    env = os.environ.copy()
+    env['SNOWFLAKE_ACCOUNT']   = get_secret_value('SNOWFLAKE_ACCOUNT')
+    env['SNOWFLAKE_USER']      = get_secret_value('SNOWFLAKE_USER')
+    env['SNOWFLAKE_PASSWORD']  = get_secret_value('SNOWFLAKE_PASSWORD')
+    env['SNOWFLAKE_ROLE']      = get_secret_value('SNOWFLAKE_ROLE')
+    env['SNOWFLAKE_WAREHOUSE'] = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    env['SNOWFLAKE_DB']        = get_secret_value('SNOWFLAKE_DB')
+    # Si usas schemas por env var en tu project: (opcionales)
+    # env['SNOWFLAKE_SCHEMA_BRONZE'] = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    # env['SNOWFLAKE_SCHEMA_SILVER'] = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+    # env['SNOWFLAKE_SCHEMA_GOLD']   = get_secret_value('SNOWFLAKE_SCHEMA_GOLD')
+
+    # Forzar a dbt a usar el profiles.yml de /home/src/dbt
+    env['DBT_PROFILES_DIR'] = '/home/src/dbt'
+
+    # 2) Comando dbt (proyecto en /home/src/dbt)
+    cmd = "cd /home/src/dbt && dbt run --select silver_trips_unified fct_trips --full-refresh --project-dir /home/src/dbt --profiles-dir /home/src/dbt"
+    print(f"▶ Ejecutando: {cmd}")
+
+    # 3) Ejecutar y mostrar logs
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(result.stderr)
+        raise Exception("Error ejecutando dbt build")
+
+    print("✅ DBT ejecutado correctamente.")

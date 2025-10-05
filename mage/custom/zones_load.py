@@ -1,0 +1,122 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+import pathlib
+from urllib.request import urlopen
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Descarga Taxi Zones CSV y lo carga a Snowflake:
+      - Stage @STG_LOOKUPS (CSV)
+      - BRONZE.TAXI_ZONES_RAW (truncate + COPY)
+    Idempotente.
+    """
+    
+    base_dir = pathlib.Path('/home/src/data/lookups')
+    base_dir.mkdir(parents=True, exist_ok=True)
+    url = 'https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv'
+    local_path = base_dir / 'taxi_zone_lookup.csv'
+    print(f'🔽 Descargando: {url}')
+    with urlopen(url) as r, open(local_path, 'wb') as f:
+        f.write(r.read())
+    print(f'✅ Archivo en {local_path} ({round(local_path.stat().st_size/1024,1)} KB)')
+
+    
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+
+    # 3) Conexión
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_bronze,
+        login_timeout=30,
+        network_timeout=30,
+        client_session_keep_alive=True,
+        authenticator='snowflake',
+        insecure_mode=True,   
+    )
+
+    cur = conn.cursor()
+
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_bronze}")
+
+        
+        print("▶ Asegurando FILE FORMAT CSV y STAGE de lookups ...")
+        cur.execute("""
+            CREATE OR REPLACE FILE FORMAT FF_CSV_TAXI_ZONES
+              TYPE = CSV
+              FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+              SKIP_HEADER = 1
+              NULL_IF = ('', 'NULL');
+        """)
+        cur.execute("""
+            CREATE STAGE IF NOT EXISTS STG_LOOKUPS
+              FILE_FORMAT = FF_CSV_TAXI_ZONES
+              COMMENT = 'Stage para archivos CSV de lookups';
+        """)
+
+        
+        print("☁️  Subiendo taxi_zone_lookup.csv al stage ...")
+        put_sql = f"PUT file://{local_path} @STG_LOOKUPS/lookups/ OVERWRITE=TRUE PARALLEL=1"
+        print(put_sql)
+        cur.execute(put_sql)
+        print(" Subida completada.")
+
+        
+        print("▶ Creando tabla BRONZE.TAXI_ZONES_RAW (si no existe) ...")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {database}.{schema_bronze}.TAXI_ZONES_RAW (
+                LocationID   INT,
+                Borough      STRING,
+                Zone         STRING,
+                service_zone STRING
+            );
+        """)
+        print("🧹 TRUNCATE para recarga limpia ...")
+        cur.execute(f"TRUNCATE TABLE {database}.{schema_bronze}.TAXI_ZONES_RAW")
+
+        print("▶ COPY INTO desde @STG_LOOKUPS/lookups/ ...")
+        cur.execute(f"""
+            COPY INTO {database}.{schema_bronze}.TAXI_ZONES_RAW
+            FROM @STG_LOOKUPS/lookups/
+            FILE_FORMAT = (FORMAT_NAME = FF_CSV_TAXI_ZONES)
+            ON_ERROR = 'ABORT_STATEMENT';
+        """)
+        print(" COPY ejecutado.")
+
+       
+        cur.execute(f"SELECT COUNT(*) FROM {database}.{schema_bronze}.TAXI_ZONES_RAW")
+        n = cur.fetchone()[0]
+        print(f"📊 TAXI_ZONES_RAW filas: {n}")
+        return {"zones_rows": n}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert output.get("zones_rows", 0) > 0, "No se cargaron filas a TAXI_ZONES_RAW"

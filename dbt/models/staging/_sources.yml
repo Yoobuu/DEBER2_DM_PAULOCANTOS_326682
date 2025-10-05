@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: DM_NYCTLC
+    schema: BRONZE
+    tables:
+      - name: YELLOW_PARQUET_RAW
+      - name: GREEN_PARQUET_RAW
+      - name: TAXI_ZONES_RAW

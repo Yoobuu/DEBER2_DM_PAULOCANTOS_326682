@@ -1,0 +1,88 @@
+if 'custom' not in globals():
+    from mage_ai.data_preparation.decorators import custom
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+import snowflake.connector
+
+@custom
+def transform_custom(*args, **kwargs):
+    """
+    Crea/actualiza DIM_ZONE en SILVER a partir de BRONZE.TAXI_ZONES_RAW.
+    Idempotente (borra y repuebla).
+    """
+    # Secrets
+    user = get_secret_value('SNOWFLAKE_USER')
+    password = get_secret_value('SNOWFLAKE_PASSWORD')
+    account = get_secret_value('SNOWFLAKE_ACCOUNT')
+    role = get_secret_value('SNOWFLAKE_ROLE')
+    warehouse = get_secret_value('SNOWFLAKE_WAREHOUSE')
+    database = get_secret_value('SNOWFLAKE_DB')
+    schema_bronze = get_secret_value('SNOWFLAKE_SCHEMA_BRONZE')
+    schema_silver = get_secret_value('SNOWFLAKE_SCHEMA_SILVER')
+
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        role=role,
+        warehouse=warehouse,
+        database=database,
+        schema=schema_silver,
+        client_session_keep_alive=True,
+        login_timeout=30,
+        authenticator='snowflake',
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE ROLE {role}")
+        cur.execute(f"USE WAREHOUSE {warehouse}")
+        cur.execute(f"USE DATABASE {database}")
+        cur.execute(f"USE SCHEMA {schema_silver}")
+        cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+
+        # 1) Crear tabla DIM_ZONE si no existe
+        print("▶ Creando tabla SILVER.DIM_ZONE (si no existe) ...")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {database}.{schema_silver}.DIM_ZONE (
+                zone_id       INT       PRIMARY KEY,
+                zone_name     STRING,
+                borough       STRING,
+                service_zone  STRING,
+                created_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            );
+        """)
+
+        # 2) Borrar y repoblar desde BRONZE
+        print("🧹 Limpiando DIM_ZONE para recarga limpia ...")
+        cur.execute(f"TRUNCATE TABLE {database}.{schema_silver}.DIM_ZONE")
+
+        print("⬇️ Insertando desde BRONZE.TAXI_ZONES_RAW ...")
+        cur.execute(f"""
+            INSERT INTO {database}.{schema_silver}.DIM_ZONE (zone_id, zone_name, borough, service_zone)
+            SELECT
+                LocationID   AS zone_id,
+                Zone         AS zone_name,
+                Borough      AS borough,
+                service_zone
+            FROM {database}.{schema_bronze}.TAXI_ZONES_RAW;
+        """)
+
+        # 3) Verificación
+        cur.execute(f"SELECT COUNT(*) FROM {database}.{schema_silver}.DIM_ZONE")
+        n = cur.fetchone()[0]
+        print(f"📊 DIM_ZONE filas: {n}")
+        return {"dim_zone_rows": n}
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None
+    assert output.get("dim_zone_rows", 0) > 0, "DIM_ZONE quedó vacía"
