@@ -1,6 +1,0 @@
-.env
-.secrets/
-__pycache__/
-.ipynb_checkpoints/
-*.log
-data/
