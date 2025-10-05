@@ -1,3 +1,10 @@
+
+# Deber2 (PSet 2)
+
+**Alumno:** Paulo Cantos  
+**Fecha:** 5/10/2025  
+**Codigo Banner:** 326682  
+
 # NYCTLC — Pipeline Mage + Snowflake + dbt (Bronze → Silver → Gold)
 
 ## Objetivo
